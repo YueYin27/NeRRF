@@ -89,6 +89,24 @@ def extra_args(parser):
         "--sphere_radius", type=float, default=1.0, help="Radius of the bounding sphere"
     )
     parser.add_argument("--ior", type=float, default=1.5, help="index of refraction")
+    parser.add_argument(
+        "--use_wandb",
+        action="store_true",
+        default=False,
+        help="Enable Weights & Biases logging",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="NeRRF",
+        help="Wandb project name",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="Wandb entity (username or team name)",
+    )
     return parser
 
 
@@ -290,6 +308,73 @@ class RRFTrainer(trainlib.Trainer):
         rgbs_gt = image * 0.5 + 0.5  # (3, H, W)
         renderer.eval()
         gt = rgbs_gt.permute(1, 2, 0).cpu().numpy().reshape(H, W, 3)
+
+        if args.stage == 1:
+            # Stage 1: visualize predicted mask vs GT mask
+            mvp = data["mvp"][0].to(device=device)
+            gt_mask = data["mask"][0].to(device=device).float()  # (1, H, W) or (H, W)
+            with torch.no_grad():
+                test_rays = cam_rays.reshape(1, H * W, -1)
+                pred_mask, _ = renderer.render_mask(
+                    test_rays, mvp, h=H, w=W, global_step=global_step
+                )
+            # pred_mask: (1, H, W) or (H, W), values in [0, 1]
+            pred_mask_np = pred_mask.squeeze().cpu().numpy()
+            pred_mask_np = np.clip(pred_mask_np, 0, 1)
+            # Resize to match GT if needed
+            if pred_mask_np.shape != (H, W):
+                from PIL import Image as PILImage
+                pred_mask_np = np.array(
+                    PILImage.fromarray((pred_mask_np * 255).astype(np.uint8)).resize(
+                        (W, H), PILImage.BILINEAR
+                    )
+                ) / 255.0
+
+            gt_mask_np = gt_mask.squeeze().cpu().numpy()
+            if gt_mask_np.shape != (H, W):
+                gt_mask_np = gt_mask_np[:H, :W]
+
+            # Convert masks to 3-channel for visualization
+            gt_mask_3ch = np.stack([gt_mask_np] * 3, axis=-1).astype(np.float32)
+            pred_mask_3ch = np.stack([pred_mask_np] * 3, axis=-1).astype(np.float32)
+
+            vis = np.hstack([gt_mask_3ch, pred_mask_3ch])
+            mask_mse = float(np.mean((pred_mask_np - gt_mask_np) ** 2))
+            mask_iou = float(
+                np.sum((pred_mask_np > 0.5) & (gt_mask_np > 0.5))
+                / max(np.sum((pred_mask_np > 0.5) | (gt_mask_np > 0.5)), 1)
+            )
+            vals = {"mask_mse": mask_mse, "mask_iou": mask_iou}
+            print(f"mask mse {mask_mse:.6f}, iou {mask_iou:.4f}")
+
+            # Health check: if mask IoU is extremely low early in training,
+            # automatically reset the SDF from the base mesh and restart
+            # SDF pretraining. This helps recover from collapsed geometry
+            # (empty mesh / all-black masks) for stage 1.
+            if global_step < 2000 and mask_iou < 0.01:
+                print(
+                    "[HEALTH] mask IoU is very low early in training; "
+                    "resetting SDF from base sphere and restarting SDF pretrain."
+                )
+                renderer.reset_sdf_from_base_mesh()
+                # Reset optimizer state since we've reinitialized the network
+                self.optim = torch.optim.Adam(
+                    [
+                        {
+                            "params": [
+                                p
+                                for n, p in renderer.named_parameters()
+                                if ("sdf" in n) or ("deform" in n) and p.requires_grad
+                            ],
+                            "lr": 0.001,
+                        },
+                    ],
+                )
+
+            renderer.train()
+            return vis, vals, gt_mask_3ch, pred_mask_3ch
+
+        # Stage 2+: visualize predicted RGB vs GT
         with torch.no_grad():
             test_rays = cam_rays  # (H, W, 8)
             test_rays = test_rays.reshape(1, H * W, -1)
@@ -362,7 +447,7 @@ class RRFTrainer(trainlib.Trainer):
 
         # set the renderer network back to train mode
         renderer.train()
-        return vis, vals
+        return vis, vals, gt, rgb_psnr
 
     def test_step(self, data, global_step, idx=None):
         return self.eval_step(data, global_step)

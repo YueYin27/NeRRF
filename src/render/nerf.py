@@ -14,6 +14,7 @@ import trimesh
 import mesh_raycast
 import math
 import os
+import sys
 import cubvh
 import tqdm
 from util.meshutils import clean_mesh
@@ -212,7 +213,18 @@ class NeRFRenderer(torch.nn.Module):
                 pretrain_iters = 10000
                 batch_size = 10240
                 print(f"[INFO] start SDF pre-training ")
-                for i in tqdm.tqdm(range(pretrain_iters)):
+                use_tqdm = sys.stderr.isatty()
+                pbar = tqdm.tqdm(
+                    range(pretrain_iters),
+                    desc="[INFO] SDF pre-train",
+                    leave=False,
+                    position=0,
+                    dynamic_ncols=False,
+                    ncols=80,
+                    mininterval=0.5,
+                    disable=not use_tqdm,
+                )
+                for i in pbar:
                     rand_idx = torch.randint(0, self.verts.shape[0], (batch_size,))
                     p = self.verts[rand_idx]
                     ref_value = sdf[rand_idx]
@@ -222,7 +234,11 @@ class NeRFRenderer(torch.nn.Module):
                     loss.backward()
                     optimizer.step()
                     if i % 100 == 0:
-                        print(f"[INFO] SDF pre-train: {loss.item()}")
+                        if use_tqdm:
+                            pbar.set_postfix(loss=f"{loss.item():.6e}")
+                        else:
+                            pct = 100 * (i + 1) / pretrain_iters
+                            print(f"[INFO] SDF pre-train: {pct:.1f}% loss={loss.item():.6e}", flush=True)
 
                 print(f"[INFO] SDF pre-train final loss: {loss.item()}")
                 del mesh, BVH
@@ -259,6 +275,85 @@ class NeRFRenderer(torch.nn.Module):
         self.lgt.build_mips()
         self.material.requires_grad = False
         self.lgt.base.requires_grad = False
+
+    def reset_sdf_from_base_mesh(self):
+        """
+        (Re)initialize the SDF/deform MLP from the base sphere mesh and run
+        the SDF pretraining loop. Used both at construction time and as a
+        health-check reset if geometry collapses (e.g., empty mesh / black masks).
+        """
+        if self.stage != 1 or self.use_grid:
+            return
+
+        print(f"[HEALTH] Resetting SDF from base mesh")
+
+        # Ensure gradients are enabled and parameters are trainable
+        was_training = self.training
+        self.train()
+        for p in self.encoder.parameters():
+            p.requires_grad_(True)
+        for p in self.sdf_and_deform_mlp.parameters():
+            p.requires_grad_(True)
+
+        with torch.enable_grad():
+            mesh = trimesh.load("data/init/sphere.obj", force="mesh")
+            scale = (
+                1.0 / np.array(mesh.bounds[1] - mesh.bounds[0]).max()
+            )  # if use eikonal dataset, change 1.0 to 0.2
+            center = np.array(mesh.bounds[1] + mesh.bounds[0]) / 2
+            mesh.vertices = (mesh.vertices - center) * scale
+
+            BVH = cubvh.cuBVH(
+                mesh.vertices, mesh.faces
+            )  # build with numpy.ndarray/torch.Tensor
+            sdf, face_id, _ = BVH.signed_distance(
+                self.verts, return_uvw=False, mode="watertight"
+            )
+            sdf *= -1  # INNER is POSITIVE
+
+            # pretraining
+            loss_fn = torch.nn.MSELoss()
+            optimizer = torch.optim.Adam(
+                list(self.encoder.parameters()) + list(self.sdf_and_deform_mlp.parameters()),
+                lr=1e-3,
+            )
+
+            pretrain_iters = 10000
+            batch_size = 10240
+            print(f"[INFO] start SDF pre-train ")
+            use_tqdm = sys.stderr.isatty()
+            pbar = tqdm.tqdm(
+                range(pretrain_iters),
+                desc="[INFO] SDF pre-train",
+                leave=False,
+                position=0,
+                dynamic_ncols=False,
+                ncols=80,
+                mininterval=0.5,
+                disable=not use_tqdm,
+            )
+            for i in pbar:
+                rand_idx = torch.randint(0, self.verts.shape[0], (batch_size,))
+                p = self.verts[rand_idx]
+                ref_value = sdf[rand_idx]
+                output = self.sdf_and_deform_mlp(self.encoder(p))
+                loss = loss_fn(output[..., 0], ref_value)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                if i % 100 == 0:
+                    if use_tqdm:
+                        pbar.set_postfix(loss=f"{loss.item():.6e}")
+                    else:
+                        pct = 100 * (i + 1) / pretrain_iters
+                        print(f"[INFO] SDF pre-train: {pct:.1f}% loss={loss.item():.6e}", flush=True)
+
+            print(f"[INFO] SDF pre-train final loss: {loss.item()}")
+            del mesh, BVH
+
+        # Restore original training/eval mode
+        if not was_training:
+            self.eval()
 
     @torch.no_grad()
     def getAABB(self):
@@ -440,8 +535,17 @@ class NeRFRenderer(torch.nn.Module):
             deform = torch.tanh(deform) / self.tet_grid_size
         verts, faces, uvs, uv_idx = self.dmtet(self.verts + deform, sdf, self.indices)
 
-        if not self.use_grid:
+        if faces.shape[0] == 0:
+            # DMTet produced an empty mesh (SDF has no zero-crossing yet).
+            # Return a zero mask so training can continue and evolve the SDF.
+            h_ = 272 if (h != 800) else h
+            mask_out = torch.zeros(1, h_, w, device=sdf.device)
+            ek_loss = torch.zeros(1, device=sdf.device, requires_grad=True).sum()
+            return mask_out, ek_loss
+
+        if not self.use_grid and torch.is_grad_enabled():
             # eikonal loss, regularize surface normal and surface sdf
+            # (skip when called under torch.no_grad(), e.g. during validation)
             verts_ = verts.detach().clone().requires_grad_(True)
             pred_ = self.sdf_and_deform_mlp(
                 self.encoder(verts_, step_id=global_step)
@@ -977,23 +1081,23 @@ class NeRFRenderer(torch.nn.Module):
         in_dir_ = hit_rays_[..., 3:6]
         normals_ = self.adjust_normal(normals_, in_dir_)
 
-        # second refraction
-        refr_rays_ = torch.zeros_like(hit_rays_)
-        refr_rays_[:, :3] = hit_pts_
+        # second refraction (only for rays that hit second surface)
+        refr_rays_second = torch.zeros_like(hit_rays_)
+        refr_rays_second[:, :3] = hit_pts_
         cos_i_ = (-in_dir_ * normals_).sum(dim=1)
         tmp = 1 - (n**2) * (1 - cos_i_**2)
         tmp[tmp < 0] = 0.0
         cos_o_ = torch.sqrt(tmp)
         refr_dir_ = n * in_dir_ + (n * cos_i_ - cos_o_).unsqueeze(-1) * normals_
         refr_dir_ = refr_dir_ / torch.norm(refr_dir_, dim=-1).unsqueeze(-1)
-        refr_rays_[:, 3:6] = refr_dir_
+        refr_rays_second[:, 3:6] = refr_dir_
 
-        # dealing with rays missing the second intersection (unwatertight surface)
-        invalid_mask_ = (valid_mask_ == False).to(device=rays.device)
-        refr_rays_ = copy_index(refr_rays_, invalid_mask_, refr_rays[invalid_mask_])
-        out_rays = copy_index(rays, valid_mask_, refr_rays_)
+        # combine: use second refraction where valid, first refraction where missed
+        refr_rays_ = refr_rays.clone()
+        refr_rays_[valid_mask_] = refr_rays_second
+        out_rays = copy_index(rays, valid_mask, refr_rays_)
         fresnel = 1 - fresnel_1
-        return out_rays, valid_mask, None, None, fresnel, None
+        return out_rays, valid_mask, None, refl_rays if reflection else None, fresnel, None
 
     def Fresnel_term(self, n, in_dir, out_dir, normal):
         in_dot = (in_dir * normal).sum(-1)
@@ -1151,6 +1255,16 @@ class NeRFRenderer(torch.nn.Module):
 
         with profiler.record_function("renderer_composite"):
             B, K = z_samp.shape
+
+            # If there are no rays to render (e.g. reflection rays when no hits),
+            # short-circuit and return empty tensors instead of calling the model.
+            if B == 0:
+                device = z_samp.device
+                weights = torch.zeros((0, K), device=device, dtype=z_samp.dtype)
+                rgb = torch.zeros((0, 3), device=device, dtype=z_samp.dtype)
+                depth = torch.zeros((0,), device=device, dtype=z_samp.dtype)
+                return weights, rgb, depth
+
             deltas = z_samp[:, 1:] - z_samp[:, :-1]  # (B, K-1)
             delta_inf = rays[:, -1:] - z_samp[:, -1:]
             deltas = torch.cat([deltas, delta_inf], -1)  # (B, K)
@@ -1269,6 +1383,15 @@ class NeRFRenderer(torch.nn.Module):
                     reflection=reflection,
                     refraction=refraction,
                 )
+                # In stage 2 we only optimize the NeRF network, not the SDF.
+                # Detach trace_ray outputs to avoid inplace-op errors from
+                # the SDF computation graph during backprop.
+                if self.stage == 2:
+                    rays = rays.detach()
+                    if fresnel is not None:
+                        fresnel = fresnel.detach()
+                    if reflect_rays is not None:
+                        reflect_rays = reflect_rays.detach()
                 if ray_sampling:
                     (
                         rays_,
@@ -1362,8 +1485,8 @@ class NeRFRenderer(torch.nn.Module):
                     )
 
                 if refraction and fresnel is not None:
-                    rgb = coarse_composite[1]
-                    rgb[valid_mask] = fresnel.unsqueeze(-1) * rgb[valid_mask]
+                    rgb = coarse_composite[1].clone()
+                    rgb[valid_mask] = fresnel.unsqueeze(-1) * coarse_composite[1][valid_mask]
                     if reflection:
                         rgb[valid_mask] = (
                             rgb[valid_mask]
@@ -1419,8 +1542,8 @@ class NeRFRenderer(torch.nn.Module):
                         )
 
                     if refraction and fresnel is not None:
-                        rgb = fine_composite[1]
-                        rgb[valid_mask] = fresnel.unsqueeze(-1) * rgb[valid_mask]
+                        rgb = fine_composite[1].clone()
+                        rgb[valid_mask] = fresnel.unsqueeze(-1) * fine_composite[1][valid_mask]
                         if reflection:
                             rgb[valid_mask] = (
                                 rgb[valid_mask]
@@ -1503,12 +1626,19 @@ class NeRFRenderer(torch.nn.Module):
         vertices = vertices.detach().cpu().numpy()
         triangles = triangles.detach().cpu().numpy()
 
-        # clean
-        vertices = vertices.astype(np.float32)
-        triangles = triangles.astype(np.int32)
-        vertices, triangles = clean_mesh(
-            vertices, triangles, remesh=True, remesh_size=0.01
-        )
+        # If DMTet produced an empty mesh at this step, skip cleaning/decimation
+        # and return an empty trimesh instead of crashing. This can happen
+        # transiently when the SDF has no zero-crossing.
+        if triangles.shape[0] == 0:
+            vertices = np.zeros((0, 3), dtype=np.float32)
+            triangles = np.zeros((0, 3), dtype=np.int32)
+        else:
+            # clean
+            vertices = vertices.astype(np.float32)
+            triangles = triangles.astype(np.int32)
+            vertices, triangles = clean_mesh(
+                vertices, triangles, remesh=True, remesh_size=0.01
+            )
 
         # decimation
         if decimate_target > 0 and triangles.shape[0] > decimate_target:

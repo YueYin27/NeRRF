@@ -72,7 +72,7 @@ class Dataset(torch.utils.data.Dataset):
         self.type = dataset_type
         if self.type == "blender":
             self.image_size = (800, 800)
-            self.z_near, self.z_far = 0.0, 5
+            self.z_near, self.z_far = 0.05, 1e5
             # self.depth_dir = data_dir + "/../../depth/" + os.path.basename(data_dir)
             if self.split == "train":
                 self.image_dir = data_dir + '/train'
@@ -83,7 +83,10 @@ class Dataset(torch.utils.data.Dataset):
                 self.image_dir = data_dir + '/train'
                 self.meta_dir = data_dir + "/transforms_train.json"
 
-            self.image_list = list(sorted(Path(self.image_dir).glob('*.png'), key=lambda p: int(p.stem.strip('r_'))))
+            self.image_list = list(sorted(
+                [p for p in Path(self.image_dir).glob('r_*.png') if p.stem.count('_') == 1],
+                key=lambda p: int(p.stem.split('_')[1])
+            ))
         else:
             raise NotImplementedError
         
@@ -138,11 +141,28 @@ class Dataset(torch.utils.data.Dataset):
             raise NotImplementedError
 
         image_path = str(img_path)
-        img = imageio.imread(image_path) / 255.
-        mask = img[...,3] > 0.01
-        mask = torch.tensor(mask).unsqueeze(0)
+        img = imageio.imread(image_path)
 
-        img = (img[..., :3] * img[...,3:] + (1-img[...,3:])) * 255
+        if img.shape[-1] == 4:
+            # RGBA image: extract alpha as mask, composite over white
+            alpha = img[..., 3:4].astype(np.float32) / 255.0
+            rgb = img[..., :3].astype(np.float32) / 255.0
+            mask = alpha[..., 0] > 0.01
+            img = (rgb * alpha + (1.0 - alpha)) * 255.0
+        else:
+            # RGB image: load separate mask file
+            mask_path = img_path.parent / f"{name}_mask_0000.png"
+            if mask_path.exists():
+                mask_img = imageio.imread(str(mask_path))
+                if mask_img.ndim == 3:
+                    mask_img = mask_img[..., 0]
+                mask = (mask_img / 255.) > 0.01
+            else:
+                mask = np.ones(img.shape[:2], dtype=bool)
+            img = img[..., :3]
+
+        mask = torch.tensor(mask).unsqueeze(0)
+        img = np.clip(img, 0, 255).astype(np.uint8)
         img = self.image2tensor(img)
 
         fx = fy = self.focal

@@ -7,3 +7,5 @@ tet_visual/
 *.png
 
 *.pyc
+wandb/
+blender/

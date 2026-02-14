@@ -553,6 +553,29 @@ def copy_index(inputs, mask, src):
     - mask:		torch.Tensor (H*W)
     - src:		torch.Tensor (N) / (N, k)
     """
-    index = torch.nonzero(mask).reshape(-1).long()
+    if mask.dtype != torch.bool:
+        mask = mask != 0
+    if mask.device != inputs.device:
+        mask = mask.to(inputs.device)
+    if mask.ndim > 1:
+        if mask.shape[-1] == 1:
+            mask = mask.reshape(-1)
+        else:
+            raise ValueError(
+                f"copy_index expects a 1D mask or trailing singleton dim, got {tuple(mask.shape)}"
+            )
+    if mask.shape[0] != inputs.shape[0]:
+        raise ValueError(
+            f"copy_index mask length {mask.shape[0]} does not match input dim0 {inputs.shape[0]}"
+        )
+
+    index = torch.where(mask)[0].long()
+    if src.shape[0] != index.numel():
+        raise ValueError(
+            f"copy_index src rows {src.shape[0]} does not match selected rows {index.numel()}"
+        )
+    if index.numel() == 0:
+        return inputs.clone()
+
     outputs = inputs.index_copy(0, index, src)
     return outputs

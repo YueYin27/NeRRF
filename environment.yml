@@ -1,4 +1,4 @@
-name: nerrf
+name: nerrf1
 channels:
   - conda-forge
   - anaconda
