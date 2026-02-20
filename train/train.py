@@ -7,7 +7,7 @@ sys.path.insert(
 )
 sys.path.append("dataloader")
 
-
+from dataset.dataloader_ours import Dataset
 import trainlib
 from model import make_model, loss
 from render import NeRFRenderer
