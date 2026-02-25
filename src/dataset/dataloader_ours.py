@@ -72,7 +72,7 @@ class Dataset(torch.utils.data.Dataset):
         self.type = dataset_type
         if self.type == "blender":
             self.image_size = (800, 800)
-            self.z_near, self.z_far = 0.05, 1e5
+            self.z_near, self.z_far = 0.05, 10
             # self.depth_dir = data_dir + "/../../depth/" + os.path.basename(data_dir)
             if self.split == "train":
                 self.image_dir = data_dir + '/train'
@@ -80,8 +80,6 @@ class Dataset(torch.utils.data.Dataset):
             else:
                 self.image_dir = data_dir + '/test'
                 self.meta_dir = data_dir + "/transforms_test.json"
-                self.image_dir = data_dir + '/train'
-                self.meta_dir = data_dir + "/transforms_train.json"
 
             self.image_list = list(sorted(
                 [p for p in Path(self.image_dir).glob('r_*.png') if p.stem.count('_') == 1],

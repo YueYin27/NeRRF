@@ -211,13 +211,15 @@ class RRFTrainer(trainlib.Trainer):
     def post_batch(self, epoch, batch):
         renderer.sched_step(args.batch_size)
 
-    def extra_save_state(self, global_step):
+    def extra_save_state(self, global_step, save_mesh=True):
         torch.save(renderer.state_dict(), self.renderer_state_path)
-        mesh = renderer.export_mesh(global_step=global_step)
-        geo_path = "data/learned_geo/"
-        if not os.path.exists(geo_path):
-            os.makedirs(geo_path)
-        mesh.export(geo_path + args.name + str(global_step) + ".obj")
+        if save_mesh:
+            mesh = renderer.export_mesh(global_step=global_step)
+            geo_path = "data/learned_geo/"
+            if not os.path.exists(geo_path):
+                os.makedirs(geo_path)
+            # Save as name stage 2 expects (e.g. expname.obj)
+            mesh.export(geo_path + args.name.split("_")[0] + ".obj")
 
     def calc_losses(self, data, is_train=True, global_step=0):
         stage = args.stage

@@ -9,3 +9,4 @@ tet_visual/
 *.pyc
 wandb/
 blender/
+outputs/

@@ -69,6 +69,7 @@ class Trainer:
                     name=f"{args.name}_stage{args.stage}",
                     config=wandb_config,
                     resume="allow",
+                    dir=os.path.join(os.environ.get("TMPDIR", "/tmp"), "wandb"),
                 )
 
         self.fixed_test = hasattr(args, "fixed_test") and args.fixed_test
@@ -122,9 +123,10 @@ class Trainer:
         """
         pass
 
-    def extra_save_state(self, global_step):
+    def extra_save_state(self, global_step, save_mesh=True):
         """
-        Ran at each save step for saving extra state
+        Ran at each save step for saving extra state.
+        save_mesh: if False, skip saving mesh to learned_geo (only save other state).
         """
         pass
 
@@ -213,7 +215,7 @@ class Trainer:
                             )
                         torch.save({"iter": step_id + 1}, self.iter_state_path)
                         if self.args.stage == 1:
-                            self.extra_save_state(global_step=step_id)
+                            self.extra_save_state(global_step=step_id, save_mesh=False)
                     ############################
 
                     if (
@@ -299,4 +301,4 @@ class Trainer:
             wandb.finish()
 
         if self.args.stage == 1:
-            self.extra_save_state(global_step=step_id)
+            self.extra_save_state(global_step=step_id, save_mesh=True)

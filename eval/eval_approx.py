@@ -1,5 +1,6 @@
 import sys
 import os
+from pathlib import Path
 
 sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -7,18 +8,21 @@ sys.path.insert(
 
 import torch
 import numpy as np
+import imageio
 import util
 from render import NeRFRenderer
 from model import make_model
+from tqdm import tqdm
 
 sys.path.append("dataloader")
 import math
 from skimage.metrics import structural_similarity as compare_ssim
 from skimage.metrics import peak_signal_noise_ratio as compare_psnr
+from skimage.transform import resize as skimage_resize
 from lpips import LPIPS
 import torch.nn.functional as F
 from math import exp
-from dataset.dataloader import Dataset
+from dataset.dataloader_ours import Dataset
 
 compare_lpips = LPIPS(net="squeeze").cpu()
 
@@ -164,6 +168,12 @@ def extra_args(parser):
         "--sphere_radius", type=float, default=1.0, help="Radius of the bounding sphere"
     )
     parser.add_argument("--ior", type=float, default=1.5, help="index of refraction")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="outputs",
+        help="Base directory for saving output images (outputs/<scene>/rgb_images)",
+    )
     return parser
 
 
@@ -182,10 +192,16 @@ model_path = "%s/%s/pixel_nerf_latest" % (
     args.checkpoints_path,
     args.name,
 )
+_loaded = False
 if hasattr(net, "load_weights") and os.path.exists(model_path):
     net.load_state_dict(torch.load(model_path, map_location=device))
+    _loaded = True
 if os.path.exists(default_net_state_path):
     net.load_state_dict(torch.load(default_net_state_path, map_location=device))
+    _loaded = True
+if not _loaded:
+    print(f"Skipping '{args.name}': no checkpoint found.")
+    sys.exit(0)
 
 dset = Dataset(args.datadir, stage="test")
 
@@ -253,12 +269,21 @@ total_ssim = 0.0
 total_lpips = 0.0
 cnt = 0
 
+# output folder: outputs/<scene_name>/rgb_images and distance_maps
+scene_name = args.name
+save_dir = os.path.join(args.output_dir, scene_name, "rgb_images")
+dist_save_dir = os.path.join(args.output_dir, scene_name, "distance_maps")
+Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+Path(save_dir).mkdir(parents=True, exist_ok=True)
+Path(dist_save_dir).mkdir(parents=True, exist_ok=True)
+
 source = torch.tensor(args.source, dtype=torch.long)
 NS = len(source)
 random_source = NS == 1 and source[0] == -1
 
+print(f"Evaluating scene: {scene_name}")
 with torch.no_grad():
-    for data in data_loader:
+    for data in tqdm(data_loader, desc="Processing images"):
         image = data["images"][0].to(device=device)  # (3, H, W)
         pose = data["poses"][0].to(device=device)  # (4, 4)
         focal = data["focal"][0].to(device=device)  # [2]
@@ -272,6 +297,54 @@ with torch.no_grad():
         )
         rgbs = rgbs.permute(0, 2, 1).view(-1, 3, H, W).contiguous().cpu()
         rgbs_gt = rgbs_gt.unsqueeze(0).cpu()
+
+        # save side-by-side: left = GT, right = predicted (no margin)
+        gt_np = rgbs_gt.squeeze(0).permute(1, 2, 0).numpy().clip(0, 1)
+        pred_np = rgbs.squeeze(0).permute(1, 2, 0).numpy().clip(0, 1)
+        side_by_side = np.concatenate([gt_np, pred_np], axis=1)
+        imageio.imwrite(
+            os.path.join(save_dir, "r_{:d}.png".format(cnt)),
+            (side_by_side * 255).astype(np.uint8),
+        )
+
+        # save distance map side-by-side: left = GT from dataset, right = predicted (whiter = closer)
+        # Use first-hit distance from SDF with same camera rays (intrinsics + extrinsics), not volume-rendered depth.
+        gt_depth_path = os.path.join(
+            args.datadir, "test", "r_{:d}_depth_0000.png".format(cnt)
+        )
+        if os.path.isfile(gt_depth_path):
+            gt_dist = imageio.v2.imread(gt_depth_path)
+            if gt_dist.ndim == 3:
+                gt_dist = gt_dist[:, :, 0]
+            if gt_dist.shape[0] != H or gt_dist.shape[1] != W:
+                gt_dist = (skimage_resize(gt_dist, (H, W), order=1, preserve_range=True)).astype(np.uint8)
+        else:
+            gt_dist = np.zeros((H, W), dtype=np.uint8)
+
+        rays_flat = cam_rays.view(-1, 8).to(device)
+        valid_mask, first_hit_depth, _ = renderer.intersection_with_sdf(
+            rays_flat, far=False
+        )
+        first_hit_depth = first_hit_depth.cpu().numpy().reshape(H, W)
+        valid_mask = valid_mask.cpu().numpy().reshape(H, W)
+
+        pred_dist_gray = np.zeros((H, W), dtype=np.uint8)
+        if valid_mask.any():
+            depth_fg = first_hit_depth[valid_mask]
+            depth_fg = depth_fg[depth_fg > 0]
+            if len(depth_fg) > 0:
+                d_min, d_max = np.percentile(depth_fg, [2, 98])
+                d_range = max(d_max - d_min, 1e-8)
+                valid = valid_mask & (first_hit_depth > 0)
+                pred_dist_gray[valid] = (
+                    (1.0 - (first_hit_depth[valid] - d_min) / d_range).clip(0, 1) * 255
+                ).astype(np.uint8)
+
+        dist_side_by_side = np.concatenate([gt_dist, pred_dist_gray], axis=1)
+        imageio.imwrite(
+            os.path.join(dist_save_dir, "r_{:d}_dist.png".format(cnt)),
+            dist_side_by_side,
+        )
 
         apply_mask = False
         if apply_mask:
@@ -303,7 +376,6 @@ with torch.no_grad():
             ssim = compare_ssim(
                 rgbs.numpy().squeeze(0),
                 rgbs_gt.numpy().squeeze(0),
-                multichannel=True,
                 data_range=1,
                 channel_axis=0,
             )
@@ -321,14 +393,8 @@ with torch.no_grad():
         # imageio.imwrite("test_eval.png", vis_u8)
 
         cnt += 1
-        print(
-            "curr psnr",
-            total_psnr / cnt,
-            "ssim",
-            total_ssim / cnt,
-            "lpips",
-            total_lpips / cnt,
-        )
-print(
-    "final psnr", total_psnr / cnt, "ssim", total_ssim / cnt, "lpips", total_lpips / cnt
-)
+
+print(f"\nScene: {scene_name}")
+print(f"  PSNR: {total_psnr / cnt:.4f}")
+print(f"  SSIM: {total_ssim / cnt:.4f}")
+print(f"  LPIPS: {total_lpips / cnt:.4f}")
